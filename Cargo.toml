@@ -1,0 +1,9 @@
+[package]
+name = "associater"
+version = "0.1.0"
+authors = ["Moritz Kiefer <moritz.kiefer@purelyfunctional.org>"]
+edition = "2018"
+
+[dependencies]
+goblin = "^0.3.4"
+clap = "^3.0.0-beta.2"
