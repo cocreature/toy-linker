@@ -6,6 +6,7 @@ use goblin::{error, Object};
 use scroll::Pwrite;
 use std::fs;
 use std::io::prelude::*;
+use std::collections::HashMap;
 
 #[derive(Clap, Debug)]
 struct Opts {
@@ -14,19 +15,28 @@ struct Opts {
     #[clap(short)]
     output: String,
 }
+#[derive(Debug)]
 struct AllocatedSection {
     section: SectionHeader,
+    index: usize,
     address: usize,
 }
 fn main() -> Result<(), error::Error> {
     let opts = Opts::parse();
     let buffer = fs::read(opts.input)?;
     let elf = goblin::elf::Elf::parse(&buffer)?;
+    println!("{:#?}", elf);
 
-    let alloc_secs: Vec<goblin::elf::SectionHeader> = elf
+    let reloc_mapping: HashMap<usize, (usize, usize)> = elf.shdr_relocs.iter().map(|(i, _)| {
+        let x: &SectionHeader = elf.section_headers.get(*i).unwrap();
+        (*i, (x.sh_link as usize, x.sh_info as usize))
+    }
+    ).collect();
+
+    let alloc_secs: Vec<(usize, goblin::elf::SectionHeader)> = elf
         .section_headers
-        .into_iter()
-        .filter(|sec| sec.sh_flags & u64::from(goblin::elf::section_header::SHF_ALLOC) != 0 && sec.sh_size > 0)
+        .into_iter().enumerate()
+        .filter(|(_i, sec)| sec.sh_flags & u64::from(goblin::elf::section_header::SHF_ALLOC) != 0 && sec.sh_size > 0)
         .collect();
 
     let ctx = goblin::container::Ctx::new(
@@ -38,12 +48,13 @@ fn main() -> Result<(), error::Error> {
 
     let allocated_secs: Vec<AllocatedSection> = alloc_secs
         .into_iter()
-        .scan(header_size, |state, section| {
+        .scan(header_size, |state, (index, section)| {
             let align = (2 as usize).pow(section.sh_addralign as u32);
             let address = (*state + align) / align * align as usize;
             *state = address + section.sh_size as usize + 1;
             Some(AllocatedSection {
                 section: section,
+                index: index,
                 address: address,
             })
         })
@@ -112,6 +123,20 @@ fn main() -> Result<(), error::Error> {
             Header::size(ctx) + allocated_secs.len() * ProgramHeader::size(ctx) + i * SectionHeader::size(ctx),
             ctx,
         )?;
+    }
+
+    for (sh_idx, reloc_sec) in elf.shdr_relocs {
+        let sec = allocated_secs.iter().find(|sec| sec.index == reloc_mapping[&sh_idx].1).unwrap();
+        for reloc in reloc_sec.iter() {
+            let a = reloc.r_addend.unwrap();
+            let sym = elf.syms.get(reloc.r_sym).unwrap();
+            let sym_sec = allocated_secs.iter().find(|sec| sec.index == sym.st_shndx).unwrap();
+            let s: i64 = sym_sec.address as i64 + sym.st_value as i64;
+            let p = sec.address as i64 + reloc.r_offset as i64;
+            let r: i64 = s + a - p;
+            vec.pwrite_with(r as i32, p as usize, ctx.le)?;
+            println!("{:#?}", r);
+        }
     }
 
 
