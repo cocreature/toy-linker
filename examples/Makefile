@@ -2,4 +2,4 @@ main: main.o
 	ld -o main main.o
 
 %.o: %.c
-	gcc -nostdlib -Wno-main -Wall -c -o $@ $< -fPIC
+	gcc -nostdlib -Wno-main -Wall -fPIC -fpie -c -o $@ $<

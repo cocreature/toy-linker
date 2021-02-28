@@ -7,3 +7,4 @@ edition = "2018"
 [dependencies]
 goblin = "^0.3.4"
 clap = "^3.0.0-beta.2"
+scroll = "^0.10.2"

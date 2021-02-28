@@ -8,7 +8,7 @@ stdenv.mkDerivation {
     rustc cargo rls racer pkgconfig
 #    clang
 #    llvm
-#    gdb
+    gdb
     gcc
 #    lldb
   ];
