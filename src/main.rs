@@ -53,6 +53,10 @@ fn allocate_sections<'a>(
     (allocated_secs, offset)
 }
 
+fn entry_point(syms: &goblin::elf::Symtab, strtab: &goblin::strtab::Strtab) -> Option<goblin::elf::Sym> {
+    syms.iter().find(|sym| strtab.get_unsafe(sym.st_name) == Some("_start"))
+}
+
 fn main() -> Result<(), error::Error> {
     let opts = Opts::parse();
     let buffer = fs::read(opts.input)?;
@@ -77,12 +81,16 @@ fn main() -> Result<(), error::Error> {
     let mut vec: Vec<u8> = Vec::new();
     vec.resize(size, 0);
 
+    let entry_sym = entry_point(&elf.syms, &elf.strtab).unwrap();
+    let entry_loc = allocated_secs.get(&entry_sym.st_shndx).unwrap().address as u64 + entry_sym.st_value;
+
+
     let elf_header = goblin::elf::header::Header {
         e_ident: [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         e_type: goblin::elf::header::ET_EXEC,
         e_machine: 0x3e,
         e_version: 0x1,
-        e_entry: 65536, // TODO
+        e_entry: entry_loc,
         e_phoff: goblin::elf::header::Header::size(ctx) as u64,
         e_shoff: goblin::elf::header::Header::size(ctx) as u64
             + allocated_secs.len() as u64 * goblin::elf::ProgramHeader::size(ctx) as u64,
@@ -98,9 +106,7 @@ fn main() -> Result<(), error::Error> {
     for (i, sec) in allocated_secs.values().enumerate() {
         let ph_header = ProgramHeader {
             p_type: goblin::elf::program_header::PT_LOAD,
-            p_flags: goblin::elf::program_header::PF_X
-                | goblin::elf::program_header::PF_R
-                | goblin::elf::program_header::PF_W,
+            p_flags: goblin::elf::program_header::PF_R,
             p_offset: sec.address as u64,
             p_vaddr: sec.address as u64,
             p_paddr: sec.address as u64,
@@ -114,10 +120,11 @@ fn main() -> Result<(), error::Error> {
             ctx,
         )?;
         if sec.section.sh_size > 0 {
-            &mut vec[sec.address..sec.address + sec.section.sh_size as usize - 1].copy_from_slice(
-                &buffer[sec.section.sh_offset as usize
-                    ..sec.section.sh_offset as usize + sec.section.sh_size as usize - 1],
-            );
+            vec.pwrite_with(
+                &buffer[sec.section.sh_offset as usize .. (sec.section.sh_offset + sec.section.sh_size - 1) as usize],
+                sec.address,
+                ()
+            )?;
         }
     }
     for (i, sec) in allocated_secs.values().enumerate() {
