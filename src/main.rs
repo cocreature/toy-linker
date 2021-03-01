@@ -128,6 +128,7 @@ fn main() -> Result<(), error::Error> {
     for (sh_idx, reloc_sec) in elf.shdr_relocs {
         let sec = allocated_secs.iter().find(|sec| sec.index == reloc_mapping[&sh_idx].1).unwrap();
         for reloc in reloc_sec.iter() {
+            assert_eq!(reloc.r_type, goblin::elf::reloc::R_X86_64_PC32);
             let a = reloc.r_addend.unwrap();
             let sym = elf.syms.get(reloc.r_sym).unwrap();
             let sym_sec = allocated_secs.iter().find(|sec| sec.index == sym.st_shndx).unwrap();
@@ -135,7 +136,6 @@ fn main() -> Result<(), error::Error> {
             let p = sec.address as i64 + reloc.r_offset as i64;
             let r: i64 = s + a - p;
             vec.pwrite_with(r as i32, p as usize, ctx.le)?;
-            println!("{:#?}", r);
         }
     }
 
