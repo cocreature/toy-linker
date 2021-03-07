@@ -462,7 +462,7 @@ fn link_example() -> Result<(), error::Error> {
     let exe = tmp_dir.path().join("main");
     run(Opts { input: vec![main_o, lib_o].iter().map(|s| String::from(s.to_str().unwrap())).collect(), output: String::from(exe.to_str().unwrap()) })?;
     let output = Command::new(exe).output()?;
-    println!("{:#?}", output.status);
+    println!("{:#?}", output);
     assert_eq!(output.status.code(), Some(42));
     let out = std::str::from_utf8(&output.stdout).unwrap();
     assert_eq!(out, "Hello world\nwuhu\n");
