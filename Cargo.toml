@@ -1,5 +1,5 @@
 [package]
-name = "associater"
+name = "toy-linker"
 version = "0.1.0"
 authors = ["Moritz Kiefer <moritz.kiefer@purelyfunctional.org>"]
 edition = "2018"
