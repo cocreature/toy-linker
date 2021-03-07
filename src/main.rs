@@ -175,7 +175,7 @@ impl<'a> Input<'a> {
         let num_prog_headers = 3;
         // TODO For now, we omit section headers but they would be useful for debugging.
         // let num_sec_headers = self.code_sections.len() + self.data_sections.len() + self.ro_data_sections.len();
-        let mut offset = header_size + ProgramHeader::size(ctx) * num_prog_headers;
+        let mut offset = SEGMENT_START;
         let mut code_sections = Vec::new();
         let mut data_sections = Vec::new();
         let mut ro_data_sections = Vec::new();
@@ -379,6 +379,8 @@ impl<'a> Output<'a> {
 }
 
 const PAGE_SIZE: usize = 4096;
+
+const SEGMENT_START: usize = 0x400000;
 
 fn align(offset: usize, align: usize) -> usize {
     let r = offset % align;
