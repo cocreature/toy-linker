@@ -4,6 +4,7 @@ use goblin::elf::{Header, ProgramHeader, SectionHeader};
 use goblin::error;
 use scroll::Pwrite;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fs;
 use std::io::prelude::*;
 
@@ -14,159 +15,365 @@ struct Opts {
     #[clap(short)]
     output: String,
 }
+
 #[derive(Debug)]
-struct AllocatedSection<'a> {
-    section: &'a SectionHeader,
+struct InputSection<'a> {
+    file_idx: usize,
+    shdr_idx: goblin::elf::ShdrIdx,
+    section: SectionHeader,
+    // Inline name for debugging
+    name: &'a str,
+}
+
+#[derive(Debug)]
+struct RelocationSection<'a> {
+    applies_to_file: usize,
+    applies_to_sec: goblin::elf::ShdrIdx,
+    relocations: goblin::elf::RelocSection<'a>,
+}
+
+#[derive(Debug)]
+struct Symbol<'a> {
+    name: &'a str,
+    sym: goblin::elf::Sym,
+}
+
+#[derive(Debug)]
+struct SymbolTable<'a> {
+    by_file: HashMap<usize, (goblin::elf::Symtab<'a>, goblin::strtab::Strtab<'a>)>,
+    globals: HashMap<&'a str, (usize, usize)>,
+}
+
+impl<'a> SymbolTable<'a> {
+    fn new() -> Self {
+        SymbolTable {
+            by_file: HashMap::new(),
+            globals: HashMap::new(),
+        }
+    }
+    fn insert(&mut self, file_idx: usize, symtab: goblin::elf::Symtab<'a>, strtab: goblin::strtab::Strtab<'a>) -> () {
+        use goblin::elf::sym::*;
+        for (sym_idx, sym) in symtab.iter().enumerate() {
+            if st_bind(sym.st_info) == STB_GLOBAL {
+                let name = strtab.get_unsafe(sym.st_name).unwrap();
+                self.globals.insert(name, (file_idx, sym_idx));
+            }        }
+        self.by_file.insert(file_idx, (symtab, strtab));
+    }
+    fn get(&self, file_idx: usize, sym_idx: usize) -> goblin::elf::Sym {
+        let symtab = &self.by_file.get(&file_idx).unwrap().0;
+        symtab.get(sym_idx).unwrap()
+    }
+}
+
+#[derive(Debug)]
+struct Input<'a> {
+    file_buffers: Vec<&'a [u8]>,
+    code_sections: Vec<InputSection<'a>>,
+    data_sections: Vec<InputSection<'a>>,
+    ro_data_sections: Vec<InputSection<'a>>,
+    reloc_sections: Vec<RelocationSection<'a>>,
+    symtab: SymbolTable<'a>,
+}
+
+#[derive(Debug)]
+struct OutputSection<'a> {
     address: usize,
+    input_section: InputSection<'a>,
 }
 
-// Given a list of section headers, return a map of original section indices to the corresponding allocated section
-// as well as a total size of the binary.
-fn allocate_sections<'a>(
-    ctx: Ctx,
-    section_headers: &'a [SectionHeader],
-) -> (HashMap<usize, AllocatedSection<'a>>, usize) {
-    let alloc_secs: Vec<(usize, &'a SectionHeader)> = section_headers
-        .iter()
-        .enumerate()
-        .filter(|(_i, sec)| {
-            sec.sh_flags & u64::from(goblin::elf::section_header::SHF_ALLOC) != 0 && sec.sh_size > 0
-        })
-        .collect();
-    // Afaict, we do not need to worry about alignment for program and section headers.
-    let mut offset = Header::size(ctx)
-        + alloc_secs.len() * (ProgramHeader::size(ctx) + SectionHeader::size(ctx));
-    let allocated_secs: HashMap<usize, AllocatedSection<'a>> = alloc_secs
-        .into_iter()
-        .map(|(index, section)| {
-            let align = 2usize.pow(section.sh_addralign as u32);
-            let address = (offset + align) / align * align;
-            assert!(section.sh_size > 0);
-            offset = address + section.sh_size as usize;
-            let sec = AllocatedSection {
-                section: section,
-                address: address,
+#[derive(Debug)]
+struct Output<'a> {
+    file_buffers: Vec<&'a [u8]>,
+    code_sections: Vec<OutputSection<'a>>,
+    data_sections: Vec<OutputSection<'a>>,
+    ro_data_sections: Vec<OutputSection<'a>>,
+    // Map from file (idx, section idx) to the offset in the output file
+    section_offsets: HashMap<(usize, goblin::elf::ShdrIdx), usize>,
+    reloc_sections: Vec<RelocationSection<'a>>,
+    symtab: SymbolTable<'a>,
+    total_size: usize,
+}
+
+impl<'a> Input<'a> {
+    fn new() -> Self {
+        Input {
+            file_buffers: vec![],
+            code_sections: vec![],
+            data_sections: vec![],
+            ro_data_sections: vec![],
+            reloc_sections: vec![],
+            symtab: SymbolTable::new(),
+        }
+    }
+
+    fn process_object_file(&mut self, file: &'a [u8]) -> Result<(), error::Error> {
+        use goblin::elf::section_header::*;
+        let elf = goblin::elf::Elf::parse(file)?;
+        let file_idx = self.file_buffers.len();
+        self.file_buffers.push(file);
+        for (i, reloc) in elf.shdr_relocs {
+            let sec = &elf.section_headers[i];
+            let applies_to_sec = usize::try_from(sec.sh_info).unwrap();
+            let reloc_sec: RelocationSection = RelocationSection {
+                applies_to_file: file_idx,
+                applies_to_sec,
+                relocations: reloc,
             };
-            (index, sec)
-        })
-        .collect();
-    (allocated_secs, offset)
+            self.reloc_sections.push(reloc_sec);
+        }
+        self.symtab.insert(file_idx, elf.syms, elf.strtab);
+        for (idx, sec) in elf.section_headers.into_iter().enumerate() {
+            let name = elf.shdr_strtab.get_unsafe(sec.sh_name).unwrap();
+            match sec.sh_type {
+                SHT_PROGBITS => {
+                    let input_sec = InputSection {
+                        file_idx,
+                        shdr_idx: idx,
+                        section: sec,
+                        name: name,
+                    };
+                    if input_sec.section.sh_flags == u64::from(SHF_ALLOC | SHF_EXECINSTR) {
+                        self.code_sections.push(input_sec);
+                    } else if input_sec.section.sh_flags == u64::from(SHF_ALLOC | SHF_WRITE) {
+                        self.data_sections.push(input_sec);
+                    } else if input_sec.section.sh_flags & !u64::from(SHF_MERGE | SHF_STRINGS)
+                        == u64::from(SHF_ALLOC)
+                    {
+                        // We don’t merge sections or treat specially so everything that is read only is identical to us.
+                        self.ro_data_sections.push(input_sec);
+                    } else if input_sec.section.sh_flags & u64::from(SHF_ALLOC)
+                        == u64::from(SHF_ALLOC)
+                    {
+                        // Panic on unknown alloc flags, we ignore non-alloc sections.
+                        panic!("Unknown flags {} in {}", input_sec.section.sh_flags, name);
+                    }
+                }
+                SHT_NULL | SHT_NOBITS | SHT_RELA | SHT_SYMTAB | SHT_STRTAB => {}
+                unknown => panic!(
+                    "Unknown section type: {} ({})",
+                    goblin::elf::section_header::sht_to_str(unknown),
+                    unknown
+                ),
+            }
+        }
+        Ok(())
+    }
+    fn allocate(self, ctx: Ctx) -> Output<'a> {
+        let mut section_offsets = HashMap::new();
+        let header_size = Header::size(ctx);
+        // code, data, ro_data
+        let num_prog_headers = 3;
+        // TODO For now, we omit section headers but they would be useful for debugging.
+        // let num_sec_headers = self.code_sections.len() + self.data_sections.len() + self.ro_data_sections.len();
+        let mut offset = header_size + ProgramHeader::size(ctx) * num_prog_headers;
+        let mut code_sections = Vec::new();
+        let mut data_sections = Vec::new();
+        let mut ro_data_sections = Vec::new();
+        offset = align(offset, PAGE_SIZE);
+        for sec in self.code_sections {
+            offset = align(offset, usize::try_from(sec.section.sh_addralign).unwrap());
+            code_sections.push(OutputSection {
+                address: offset,
+                input_section: sec,
+            });
+            let sec = &code_sections.last().unwrap().input_section;
+            section_offsets.insert((sec.file_idx, sec.shdr_idx), offset);
+            offset += usize::try_from(sec.section.sh_size).unwrap();
+        }
+        offset = align(offset, PAGE_SIZE);
+        for sec in self.data_sections {
+            offset = align(offset, usize::try_from(sec.section.sh_addralign).unwrap());
+            data_sections.push(OutputSection {
+                address: offset,
+                input_section: sec,
+            });
+            let sec = &data_sections.last().unwrap().input_section;
+            section_offsets.insert((sec.file_idx, sec.shdr_idx), offset);
+            offset += usize::try_from(sec.section.sh_size).unwrap();
+        }
+        offset = align(offset, PAGE_SIZE);
+        for sec in self.ro_data_sections {
+            offset = align(offset, usize::try_from(sec.section.sh_addralign).unwrap());
+            ro_data_sections.push(OutputSection {
+                address: offset,
+                input_section: sec,
+            });
+            let sec = &ro_data_sections.last().unwrap().input_section;
+            section_offsets.insert((sec.file_idx, sec.shdr_idx), offset);
+            offset += usize::try_from(sec.section.sh_size).unwrap();
+        }
+        Output {
+            file_buffers: self.file_buffers,
+            reloc_sections: self.reloc_sections,
+            code_sections,
+            data_sections,
+            ro_data_sections,
+            section_offsets,
+            total_size: offset,
+            symtab: self.symtab,
+        }
+    }
 }
 
-fn entry_point(syms: &goblin::elf::Symtab, strtab: &goblin::strtab::Strtab) -> Option<goblin::elf::Sym> {
-    syms.iter().find(|sym| strtab.get_unsafe(sym.st_name) == Some("_start"))
+struct SegmentInfo {
+    size: usize,
+    offset: usize,
+}
+
+fn prog_header_offset(i: usize, ctx: Ctx) -> usize {
+    Header::size(ctx) + i * ProgramHeader::size(ctx)
+}
+
+fn segment_info(sections: &[OutputSection]) -> SegmentInfo {
+    if sections.len() == 0 {
+        SegmentInfo { size: 0, offset: 0 }
+    } else {
+        let first = sections.first().unwrap();
+        let last = sections.last().unwrap();
+        SegmentInfo {
+            size: last.address + usize::try_from(last.input_section.section.sh_size).unwrap()
+                - first.address,
+            offset: first.address,
+        }
+    }
+}
+
+fn prog_header(info: SegmentInfo) -> ProgramHeader {
+    let offset = u64::try_from(info.offset).unwrap();
+    let size = u64::try_from(info.size).unwrap();
+    ProgramHeader {
+        p_type: goblin::elf::program_header::PT_LOAD,
+        p_flags: 0,
+        p_offset: offset,
+        p_vaddr: offset,
+        p_paddr: offset,
+        p_filesz: size,
+        p_memsz: size,
+        p_align: u64::try_from(PAGE_SIZE).unwrap(),
+    }
+}
+
+impl<'a> Output<'a> {
+    fn write(&self, buf: &mut [u8], ctx: Ctx) -> Result<(), error::Error> {
+        use goblin::elf::program_header::*;
+        let (entry_file_idx, entry_sym_idx) = self.symtab.globals.get("_start").unwrap();
+        let entry_sym = self.symtab.get(*entry_file_idx, *entry_sym_idx);
+        let entry = u64::try_from(*self.section_offsets.get(&(*entry_file_idx, entry_sym.st_shndx)).unwrap()).unwrap() + entry_sym.st_value;
+        let elf_header = Header {
+            e_type: goblin::elf::header::ET_EXEC,
+            e_machine: goblin::elf::header::EM_X86_64,
+            e_entry: entry,
+            e_phoff: u64::try_from(Header::size(ctx)).unwrap(),
+            e_phnum: 3,
+            ..Header::new(ctx)
+        };
+        buf.pwrite_with(elf_header, 0, ctx.le)?;
+
+        let code_info = segment_info(&self.code_sections);
+        let data_info = segment_info(&self.data_sections);
+        let ro_data_info = segment_info(&self.ro_data_sections);
+
+        let code_header = ProgramHeader {
+            p_flags: PF_R | PF_X,
+            ..prog_header(code_info)
+        };
+        buf.pwrite_with(code_header, prog_header_offset(0, ctx), ctx)?;
+        let data_header = ProgramHeader {
+            p_flags: PF_R | PF_W,
+            ..prog_header(data_info)
+        };
+        buf.pwrite_with(data_header, prog_header_offset(1, ctx), ctx)?;
+        let ro_data_header = ProgramHeader {
+            p_flags: PF_R,
+            ..prog_header(ro_data_info)
+        };
+        buf.pwrite_with(ro_data_header, prog_header_offset(2, ctx), ctx)?;
+        for secs in [
+            &self.code_sections,
+            &self.data_sections,
+            &self.ro_data_sections,
+        ]
+        .iter()
+        {
+            for sec in *secs {
+                let input_sec = &sec.input_section.section;
+                let offset = usize::try_from(input_sec.sh_offset).unwrap();
+                let size = usize::try_from(input_sec.sh_size).unwrap();
+                let file_buf = self.file_buffers[sec.input_section.file_idx];
+                if size > 0 {
+                    buf.pwrite_with(&file_buf[offset..offset + size - 1], sec.address, ())?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn relocate(&self, buf: &mut [u8], ctx: Ctx) -> Result<(), error::Error> {
+        use goblin::elf::header::EM_X86_64;
+        use goblin::elf::reloc::*;
+        for reloc_sec in &self.reloc_sections {
+            let sec_offset =
+                self.section_offsets[(&(reloc_sec.applies_to_file, reloc_sec.applies_to_sec))];
+            for reloc in reloc_sec.relocations.iter() {
+                match reloc.r_type {
+                    R_X86_64_PC32 => {
+                        let a = reloc.r_addend.unwrap();
+                        let sym = self.symtab.get(reloc_sec.applies_to_file, reloc.r_sym);
+                        let sym_sec_offset = self
+                            .section_offsets
+                            .get(&(reloc_sec.applies_to_file, sym.st_shndx))
+                            .unwrap();
+                        let s = sym_sec_offset + usize::try_from(sym.st_value).unwrap();
+                        let p = sec_offset + usize::try_from(reloc.r_offset).unwrap();
+                        let r: i64 = i64::try_from(s).unwrap() + i64::try_from(a).unwrap()
+                            - i64::try_from(p).unwrap();
+                        buf.pwrite_with(i32::try_from(r).unwrap(), p, ctx.le)?;
+                    }
+                    unknown => panic!(
+                        "Unsupported relocation type: {} ({})",
+                        r_to_str(unknown, EM_X86_64),
+                        unknown
+                    ),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+const PAGE_SIZE: usize = 4096;
+
+fn align(offset: usize, align: usize) -> usize {
+    let r = offset % align;
+    if r == 0 {
+        offset
+    } else {
+        offset - r + align
+    }
 }
 
 fn main() -> Result<(), error::Error> {
     let opts = Opts::parse();
     let buffer = fs::read(opts.input)?;
-    let elf = goblin::elf::Elf::parse(&buffer)?;
 
-    // mapping from index of reloc section to sh_info, i.e., the associated section the relocation applies to.
-    let reloc_mapping: HashMap<usize, usize> = elf
-        .shdr_relocs
-        .iter()
-        .map(|(i, _)| {
-            let x: &SectionHeader = elf.section_headers.get(*i).unwrap();
-            (*i, x.sh_info as usize)
-        })
-        .collect();
+    let mut input = Input::new();
+    input.process_object_file(&buffer)?;
 
     let ctx = goblin::container::Ctx::new(
         goblin::container::Container::Big,
         goblin::container::Endian::Little,
     );
-    let (allocated_secs, size) = allocate_sections(ctx, &elf.section_headers);
 
-    let mut vec: Vec<u8> = Vec::new();
-    vec.resize(size, 0);
+    let output = input.allocate(ctx);
 
-    let entry_sym = entry_point(&elf.syms, &elf.strtab).unwrap();
-    let entry_loc = allocated_secs.get(&entry_sym.st_shndx).unwrap().address as u64 + entry_sym.st_value;
+    let mut output_vec = Vec::new();
+    output_vec.resize(output.total_size, 0);
 
+    output.write(&mut output_vec, ctx)?;
+    output.relocate(&mut output_vec, ctx)?;
 
-    let elf_header = goblin::elf::header::Header {
-        e_ident: [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        e_type: goblin::elf::header::ET_EXEC,
-        e_machine: 0x3e,
-        e_version: 0x1,
-        e_entry: entry_loc,
-        e_phoff: goblin::elf::header::Header::size(ctx) as u64,
-        e_shoff: goblin::elf::header::Header::size(ctx) as u64
-            + allocated_secs.len() as u64 * goblin::elf::ProgramHeader::size(ctx) as u64,
-        e_flags: 0,
-        e_ehsize: 0,
-        e_phentsize: goblin::elf::program_header::ProgramHeader::size(ctx) as u16,
-        e_phnum: allocated_secs.len() as u16,
-        e_shentsize: goblin::elf::section_header::SectionHeader::size(ctx) as u16,
-        e_shnum: allocated_secs.len() as u16,
-        e_shstrndx: 0,
-    };
-    &mut vec[..].pwrite_with(elf_header, 0, scroll::Endian::Little)?;
-    for (i, sec) in allocated_secs.values().enumerate() {
-        let ph_header = ProgramHeader {
-            p_type: goblin::elf::program_header::PT_LOAD,
-            p_flags: goblin::elf::program_header::PF_R,
-            p_offset: sec.address as u64,
-            p_vaddr: sec.address as u64,
-            p_paddr: sec.address as u64,
-            p_filesz: sec.section.sh_size,
-            p_memsz: sec.section.sh_size,
-            p_align: sec.section.sh_addralign,
-        };
-        &mut vec[..].pwrite_with(
-            ph_header,
-            Header::size(ctx) + i * ProgramHeader::size(ctx),
-            ctx,
-        )?;
-        if sec.section.sh_size > 0 {
-            vec.pwrite_with(
-                &buffer[sec.section.sh_offset as usize .. (sec.section.sh_offset + sec.section.sh_size - 1) as usize],
-                sec.address,
-                ()
-            )?;
-        }
-    }
-    for (i, sec) in allocated_secs.values().enumerate() {
-        let sh_header = SectionHeader {
-            sh_name: 0, // TODO
-            sh_addralign: sec.section.sh_addralign,
-            sh_offset: sec.address as u64,
-            sh_size: sec.section.sh_size,
-            sh_type: sec.section.sh_type,
-            sh_addr: sec.address as u64,
-            sh_entsize: sec.section.sh_entsize,
-            sh_flags: sec.section.sh_flags,
-            sh_link: sec.section.sh_link,
-            sh_info: sec.section.sh_info,
-        };
-        vec.pwrite_with(
-            sh_header,
-            Header::size(ctx)
-                + allocated_secs.len() * ProgramHeader::size(ctx)
-                + i * SectionHeader::size(ctx),
-            ctx,
-        )?;
-    }
-
-    // apply relocation
-    for (sh_idx, reloc_sec) in elf.shdr_relocs {
-        let sec = allocated_secs.get(&reloc_mapping[&sh_idx]).unwrap();
-        for reloc in reloc_sec.iter() {
-            assert_eq!(reloc.r_type, goblin::elf::reloc::R_X86_64_PC32);
-            let a = reloc.r_addend.unwrap();
-            let sym = elf.syms.get(reloc.r_sym).unwrap();
-            let sym_sec = allocated_secs.get(&sym.st_shndx).unwrap();
-            let s: i64 = sym_sec.address as i64 + sym.st_value as i64;
-            let p = sec.address as i64 + reloc.r_offset as i64;
-            let r: i64 = s + a - p;
-            vec.pwrite_with(r as i32, p as usize, ctx.le)?;
-        }
-    }
-
-    // Write to file
     let mut buffer = std::io::BufWriter::new(fs::File::create(&opts.output)?);
-    buffer.write_all(&mut vec)?;
+    buffer.write_all(&mut output_vec)?;
     buffer.flush()?;
 
     Ok(())
