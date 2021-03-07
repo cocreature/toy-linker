@@ -11,7 +11,7 @@ use std::io::prelude::*;
 #[derive(Clap, Debug)]
 struct Opts {
     #[clap(short)]
-    input: String,
+    input: Vec<String>,
     #[clap(short)]
     output: String,
 }
@@ -53,9 +53,11 @@ impl<'a> SymbolTable<'a> {
     }
     fn insert(&mut self, file_idx: usize, symtab: goblin::elf::Symtab<'a>, strtab: goblin::strtab::Strtab<'a>) -> () {
         use goblin::elf::sym::*;
+        use goblin::elf::section_header::*;
         for (sym_idx, sym) in symtab.iter().enumerate() {
-            if st_bind(sym.st_info) == STB_GLOBAL {
+            if st_bind(sym.st_info) == STB_GLOBAL  && sym.st_shndx != usize::try_from(SHN_UNDEF).unwrap() {
                 let name = strtab.get_unsafe(sym.st_name).unwrap();
+                println!("{:#?}, {}", sym, name);
                 self.globals.insert(name, (file_idx, sym_idx));
             }        }
         self.by_file.insert(file_idx, (symtab, strtab));
@@ -301,9 +303,7 @@ impl<'a> Output<'a> {
                 let offset = usize::try_from(input_sec.sh_offset).unwrap();
                 let size = usize::try_from(input_sec.sh_size).unwrap();
                 let file_buf = self.file_buffers[sec.input_section.file_idx];
-                if size > 0 {
-                    buf.pwrite_with(&file_buf[offset..offset + size - 1], sec.address, ())?;
-                }
+                buf.pwrite_with(&file_buf[offset..offset + size], sec.address, ())?;
             }
         }
         Ok(())
@@ -326,6 +326,22 @@ impl<'a> Output<'a> {
                         let s = sym_sec_offset + usize::try_from(sym.st_value).unwrap();
                         let p = sec_offset + usize::try_from(reloc.r_offset).unwrap();
                         let r: i64 = i64::try_from(s).unwrap() + i64::try_from(a).unwrap()
+                            - i64::try_from(p).unwrap();
+                        buf.pwrite_with(i32::try_from(r).unwrap(), p, ctx.le)?;
+                    }
+                    R_X86_64_PLT32 => {
+                        let a = reloc.r_addend.unwrap();
+                        let sym = self.symtab.get(reloc_sec.applies_to_file, reloc.r_sym);
+                        let sym_name = self.symtab.by_file.get(&reloc_sec.applies_to_file).unwrap().1.get_unsafe(sym.st_name).unwrap();
+                        let (file_idx, sym_idx) = self.symtab.globals.get(sym_name).unwrap();
+                        let sym = self.symtab.get(*file_idx, *sym_idx);
+                        let sym_sec_offset = self
+                            .section_offsets
+                            .get(&(*file_idx, sym.st_shndx))
+                            .unwrap();
+                        let l = sym_sec_offset + usize::try_from(sym.st_value).unwrap();
+                        let p = sec_offset + usize::try_from(reloc.r_offset).unwrap();
+                        let r: i64 = i64::try_from(l).unwrap() + i64::try_from(a).unwrap()
                             - i64::try_from(p).unwrap();
                         buf.pwrite_with(i32::try_from(r).unwrap(), p, ctx.le)?;
                     }
@@ -354,11 +370,13 @@ fn align(offset: usize, align: usize) -> usize {
 
 fn main() -> Result<(), error::Error> {
     let opts = Opts::parse();
-    let buffer = fs::read(opts.input)?;
-
+    let buffers:Vec<Vec<u8>> = opts.input.iter().map(|file| fs::read(file).unwrap()).collect();
     let mut input = Input::new();
-    input.process_object_file(&buffer)?;
+    for buffer in &buffers {
+        input.process_object_file(&buffer)?;
+    }
 
+    
     let ctx = goblin::container::Ctx::new(
         goblin::container::Container::Big,
         goblin::container::Endian::Little,

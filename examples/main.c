@@ -1,5 +1,7 @@
 #include <stddef.h>
 
+void extern_call();
+
 static void print(int fd, const void* buf, size_t count) {
     asm("movq $1, %%rax;"
         "movl %[fd], %%edi;"
@@ -14,6 +16,7 @@ static void print(int fd, const void* buf, size_t count) {
 static int main() {
     const char* str = "Hello world\n";
     print(1, str, 12);
+    extern_call();
     return 42;
 }
 
