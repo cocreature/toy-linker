@@ -168,13 +168,8 @@ impl<'a> Input<'a> {
         }
         Ok(())
     }
-    fn allocate(self, ctx: Ctx) -> Output<'a> {
+    fn allocate(self, _ctx: Ctx) -> Output<'a> {
         let mut section_offsets = HashMap::new();
-        let header_size = Header::size(ctx);
-        // code, data, ro_data
-        let num_prog_headers = 3;
-        // TODO For now, we omit section headers but they would be useful for debugging.
-        // let num_sec_headers = self.code_sections.len() + self.data_sections.len() + self.ro_data_sections.len();
         let mut offset = SEGMENT_START;
         let mut code_sections = Vec::new();
         let mut data_sections = Vec::new();
@@ -464,7 +459,6 @@ fn link_example() -> Result<(), error::Error> {
     let exe = tmp_dir.path().join("main");
     run(Opts { input: vec![main_o, lib_o].iter().map(|s| String::from(s.to_str().unwrap())).collect(), output: String::from(exe.to_str().unwrap()) })?;
     let output = Command::new(exe).output()?;
-    println!("{:#?}", output);
     assert_eq!(output.status.code(), Some(42));
     let out = std::str::from_utf8(&output.stdout).unwrap();
     assert_eq!(out, "Hello world\nwuhu\n");
