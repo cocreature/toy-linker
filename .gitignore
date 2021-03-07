@@ -2,3 +2,4 @@
 *~
 *.o
 /examples/main
+main

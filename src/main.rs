@@ -51,14 +51,22 @@ impl<'a> SymbolTable<'a> {
             globals: HashMap::new(),
         }
     }
-    fn insert(&mut self, file_idx: usize, symtab: goblin::elf::Symtab<'a>, strtab: goblin::strtab::Strtab<'a>) -> () {
-        use goblin::elf::sym::*;
+    fn insert(
+        &mut self,
+        file_idx: usize,
+        symtab: goblin::elf::Symtab<'a>,
+        strtab: goblin::strtab::Strtab<'a>,
+    ) -> () {
         use goblin::elf::section_header::*;
+        use goblin::elf::sym::*;
         for (sym_idx, sym) in symtab.iter().enumerate() {
-            if st_bind(sym.st_info) == STB_GLOBAL  && sym.st_shndx != usize::try_from(SHN_UNDEF).unwrap() {
+            if st_bind(sym.st_info) == STB_GLOBAL
+                && sym.st_shndx != usize::try_from(SHN_UNDEF).unwrap()
+            {
                 let name = strtab.get_unsafe(sym.st_name).unwrap();
                 self.globals.insert(name, (file_idx, sym_idx));
-            }        }
+            }
+        }
         self.by_file.insert(file_idx, (symtab, strtab));
     }
     fn get(&self, file_idx: usize, sym_idx: usize) -> goblin::elf::Sym {
@@ -260,7 +268,14 @@ impl<'a> Output<'a> {
         use goblin::elf::program_header::*;
         let (entry_file_idx, entry_sym_idx) = self.symtab.globals.get("_start").unwrap();
         let entry_sym = self.symtab.get(*entry_file_idx, *entry_sym_idx);
-        let entry = u64::try_from(*self.section_offsets.get(&(*entry_file_idx, entry_sym.st_shndx)).unwrap()).unwrap() + entry_sym.st_value;
+        let entry = u64::try_from(
+            *self
+                .section_offsets
+                .get(&(*entry_file_idx, entry_sym.st_shndx))
+                .unwrap(),
+        )
+        .unwrap()
+            + entry_sym.st_value;
         let elf_header = Header {
             e_type: goblin::elf::header::ET_EXEC,
             e_machine: goblin::elf::header::EM_X86_64,
@@ -331,7 +346,14 @@ impl<'a> Output<'a> {
                     R_X86_64_PLT32 => {
                         let a = reloc.r_addend.unwrap();
                         let sym = self.symtab.get(reloc_sec.applies_to_file, reloc.r_sym);
-                        let sym_name = self.symtab.by_file.get(&reloc_sec.applies_to_file).unwrap().1.get_unsafe(sym.st_name).unwrap();
+                        let sym_name = self
+                            .symtab
+                            .by_file
+                            .get(&reloc_sec.applies_to_file)
+                            .unwrap()
+                            .1
+                            .get_unsafe(sym.st_name)
+                            .unwrap();
                         let (file_idx, sym_idx) = self.symtab.globals.get(sym_name).unwrap();
                         let sym = self.symtab.get(*file_idx, *sym_idx);
                         let sym_sec_offset = self
@@ -368,12 +390,15 @@ fn align(offset: usize, align: usize) -> usize {
 }
 
 fn run(opts: Opts) -> Result<(), error::Error> {
-   let buffers:Vec<Vec<u8>> = opts.input.iter().map(|file| fs::read(file).unwrap()).collect();
+    let buffers: Vec<Vec<u8>> = opts
+        .input
+        .iter()
+        .map(|file| fs::read(file).unwrap())
+        .collect();
     let mut input = Input::new();
     for buffer in &buffers {
         input.process_object_file(&buffer)?;
     }
-
 
     let ctx = goblin::container::Ctx::new(
         goblin::container::Container::Big,
@@ -388,9 +413,19 @@ fn run(opts: Opts) -> Result<(), error::Error> {
     output.write(&mut output_vec, ctx)?;
     output.relocate(&mut output_vec, ctx)?;
 
-    let mut buffer = std::io::BufWriter::new(fs::File::create(&opts.output)?);
+    let exe_path = std::path::Path::new(&opts.output);
+    let exe_file = fs::File::create(exe_path)?;
+
+    let mut buffer = std::io::BufWriter::new(&exe_file);
     buffer.write_all(&mut output_vec)?;
     buffer.flush()?;
+
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = &exe_file.metadata()?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o755);
+    exe_file.set_permissions(permissions)?;
 
     Ok(())
 }
@@ -398,4 +433,37 @@ fn run(opts: Opts) -> Result<(), error::Error> {
 fn main() -> Result<(), error::Error> {
     let opts = Opts::parse();
     run(opts)
+}
+
+#[test]
+fn link_example() -> Result<(), error::Error> {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use tempdir::TempDir;
+    let tmp_dir = TempDir::new("test")?;
+    fn gcc(out_dir: &Path, file: &Path) -> Result<PathBuf, error::Error> {
+        let out = out_dir.join(file.with_extension("o"));
+        let output = Command::new("gcc").args(&[
+            "-nostdlib",
+            "-Wno-main",
+            "-Wall",
+            "-Werror",
+            "-o",
+            out.to_str().unwrap(),
+            "-c",
+            Path::new("examples").join(file).to_str().unwrap(),
+        ]).output()?;
+        assert!(output.status.success());
+        Ok(out)
+    }
+    
+    let main_o = gcc(tmp_dir.path(), Path::new("main.c"))?;
+    let lib_o = gcc(tmp_dir.path(), Path::new("lib.c"))?;
+    let exe = tmp_dir.path().join("main");
+    run(Opts { input: vec![main_o, lib_o].iter().map(|s| String::from(s.to_str().unwrap())).collect(), output: String::from(exe.to_str().unwrap()) })?;
+    let output = Command::new(exe).output()?;
+    assert_eq!(output.status.code(), Some(42));
+    let out = std::str::from_utf8(&output.stdout).unwrap();
+    assert_eq!(out, "Hello world\nwuhu\n");
+    Ok(())
 }
