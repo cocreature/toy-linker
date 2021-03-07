@@ -57,7 +57,6 @@ impl<'a> SymbolTable<'a> {
         for (sym_idx, sym) in symtab.iter().enumerate() {
             if st_bind(sym.st_info) == STB_GLOBAL  && sym.st_shndx != usize::try_from(SHN_UNDEF).unwrap() {
                 let name = strtab.get_unsafe(sym.st_name).unwrap();
-                println!("{:#?}, {}", sym, name);
                 self.globals.insert(name, (file_idx, sym_idx));
             }        }
         self.by_file.insert(file_idx, (symtab, strtab));
@@ -368,15 +367,14 @@ fn align(offset: usize, align: usize) -> usize {
     }
 }
 
-fn main() -> Result<(), error::Error> {
-    let opts = Opts::parse();
-    let buffers:Vec<Vec<u8>> = opts.input.iter().map(|file| fs::read(file).unwrap()).collect();
+fn run(opts: Opts) -> Result<(), error::Error> {
+   let buffers:Vec<Vec<u8>> = opts.input.iter().map(|file| fs::read(file).unwrap()).collect();
     let mut input = Input::new();
     for buffer in &buffers {
         input.process_object_file(&buffer)?;
     }
 
-    
+
     let ctx = goblin::container::Ctx::new(
         goblin::container::Container::Big,
         goblin::container::Endian::Little,
@@ -395,4 +393,9 @@ fn main() -> Result<(), error::Error> {
     buffer.flush()?;
 
     Ok(())
+}
+
+fn main() -> Result<(), error::Error> {
+    let opts = Opts::parse();
+    run(opts)
 }

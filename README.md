@@ -1,3 +1,3 @@
-# Associator
+# toy-linker
 
-A toy project to play around with linkers.
+A toy linker for x86_64 ELF.
