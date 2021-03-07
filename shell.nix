@@ -10,6 +10,7 @@ stdenv.mkDerivation {
 #    llvm
     gdb
     gcc
+    valgrind
 #    lldb
   ];
   buildInputs = [

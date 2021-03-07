@@ -16,5 +16,7 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
       - name: Build
         run: nix-shell --run "cargo build"
+      - name: manual Test
+        run: nix-shell --run "./test.sh"
       - name: Test
         run: nix-shell --run "cargo test"
